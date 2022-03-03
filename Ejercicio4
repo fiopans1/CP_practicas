@@ -1,0 +1,304 @@
+#include <sys/types.h>
+#include <openssl/md5.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <math.h>
+
+#define PASS_LEN 6
+#define E_BARRA 50
+#define T_INIT 4
+
+struct args{//argumentos compartidos
+    pthread_mutex_t mutex;//mutex general
+    pthread_cond_t cond;//condicion para que no haya esperas activas en el barra
+    pthread_mutex_t m_cond;//mutex solo para la condicion
+    long cnt;//para saber cuando imprimimos barra
+    int yes;
+    int blk;//para que los distintos threads esten bloqueados hasta encontrar la solucion
+    long limit;//cada cuantas iteraciones debemos imprimir barra
+    long estimacion;//variable para calcular las iteraciones por segundo
+    pthread_t id;//id del thread de la barra
+};
+
+struct abreak{
+    struct args *args; //puntero a args
+    long cnt;//contador compartido para romper contraseña
+    unsigned char *pass;//para guardar solucion
+    struct md5_info *md5;//acceso al struct md5_info
+    pthread_mutex_t mutex;//mutex para este struct
+
+
+};
+struct thread_info{
+    pthread_t id;//id de cada thread que rommpe contraseña
+    struct abreak *args;//puntero a abreak
+};
+struct md5_info{
+    unsigned char **md5;//array de claves a descodificar
+    int md5_len;//numero de claves a descodificar
+    int i_resuelto;//posicion del array de la clave que descodificamos
+};
+
+int comprobar(int * iter,pthread_mutex_t * mutex) {
+  int temp;
+  pthread_mutex_lock(mutex);
+  temp =(*iter);
+  pthread_mutex_unlock(mutex);
+  return temp;
+}
+long comprobar_long(long * iter,pthread_mutex_t * mutex) {
+  long temp;
+  pthread_mutex_lock(mutex);
+  temp =(*iter);
+  pthread_mutex_unlock(mutex);
+  return temp;
+}
+
+long ipow(long base, int exp)
+{
+    long res = 1;
+    for (;;)
+    {
+        if (exp & 1)
+            res *= base;
+        exp >>= 1;
+        if (!exp)
+            break;
+        base *= base;
+    }
+
+    return res;
+}
+
+long pass_to_long(char *str) {//convierte todo el string en un numero(revierte long to pass)
+    long res = 0;
+
+    for(int i=0; i < PASS_LEN; i++)
+        res = res * 26 + str[i]-'a';
+
+    return res;
+};
+
+void long_to_pass(long n, unsigned char *str) {  // str should have size PASS_SIZE+1
+    for(int i=PASS_LEN-1; i >= 0; i--) {//convierte un numero en un string posible de contraseña
+        str[i] = n % 26 + 'a';
+        n /= 26;
+    }
+    str[PASS_LEN] = '\0';
+}
+
+int hex_value(char c) {//pasa de base 16 a base 10
+    if (c>='0' && c <='9')
+        return c - '0';
+    else if (c>= 'A' && c <='F')
+        return c-'A'+10;
+    else if (c>= 'a' && c <='f')
+        return c-'a'+10;
+    else return 0;
+}
+
+void hex_to_num(char *str, unsigned char *hex) {//trabajamos en base 10, te convierte un string que le pases en base 16 a base 10, el valor del hash que nos
+//devuelve el terminal es en base 16, aquí lo pasamos a base 10
+    for(int i=0; i < MD5_DIGEST_LENGTH; i++){
+        hex[i] = (hex_value(str[i*2]) << 4) + hex_value(str[i*2 + 1]);
+    }
+}
+
+long min(long a, long b){
+    if(a<b){
+        return a;
+    }else{
+        return b;
+    }
+}
+
+void *break_pass(void *ptr){
+    struct abreak *abreak= ptr;
+    unsigned char res[MD5_DIGEST_LENGTH];
+    unsigned char *pass = malloc((PASS_LEN + 1) * sizeof(char));
+    int v;
+    long bound = ipow(26, PASS_LEN), casos_locales, casos_locales_limite;
+    while(1){
+        pthread_mutex_lock(&abreak->mutex);
+        if(abreak->cnt>=bound-1){
+            pthread_mutex_unlock(&abreak->mutex);
+            free(pass);
+            return NULL;
+        }
+        casos_locales=abreak->cnt;
+        abreak->cnt+=min(bound - (abreak->cnt),1000);//ojito con esta linea
+        casos_locales_limite=  abreak->cnt;
+        pthread_mutex_unlock(&abreak->mutex);
+
+        for(long i=casos_locales;i<casos_locales_limite && i<bound;i++){
+            long_to_pass(i, pass);
+            MD5(pass, PASS_LEN, res);
+            for(int j=0;j<abreak->md5->md5_len;j++){
+                v=memcmp(res, abreak->md5->md5[j], MD5_DIGEST_LENGTH);
+                if(v==0){
+                    abreak->md5->i_resuelto=j;//mirar de poner mutex
+                    break;
+                }
+            }
+            pthread_mutex_lock(&abreak->args->mutex);
+            if(abreak->args->blk==0){
+                pthread_mutex_unlock(&abreak->args->mutex);
+                free(pass);
+                return NULL;
+
+            }
+            abreak->args->cnt++;
+            abreak->args->estimacion++;
+            if(abreak->args->cnt==abreak->args->limit && abreak->args->yes==0){
+                //pthread_cond_broadcast(&abreak->args->cond);
+                abreak->args->yes=1;
+                abreak->args->cnt=0;
+
+            }
+            if(0 == v){
+                abreak->args->blk=0;
+                pthread_mutex_unlock(&abreak->args->mutex);
+                pthread_mutex_lock(&abreak->mutex);
+                abreak->pass=pass;
+                pthread_mutex_unlock(&abreak->mutex);
+                return NULL;
+            } // Found it!
+        //te compara a ver si es o no la contraseña el pass(compara en hexadecimal pero en base 10)
+            pthread_mutex_unlock(&abreak->args->mutex);
+        }
+
+
+    }
+
+}
+
+
+ 
+void *progressBar(void* ptr){
+    struct args *args =  ptr;
+        int i = 0;
+        char bar[E_BARRA+1];
+        memset(bar, 0, sizeof(bar));
+        long estimacion1,estimacion2;
+
+        const char *lable = "|/-\\";
+        while(comprobar(&args->blk,&args->mutex)){
+            estimacion1=comprobar_long(&args->estimacion,&args->mutex);
+            usleep(50000);
+            estimacion2=comprobar_long(&args->estimacion,&args->mutex);
+
+
+            printf("[%-50s][%d%%][%c][iters/sec->%ld]\r", bar, (i*2), lable[i %4 ],((estimacion2-estimacion1)*2));
+            fflush(stdout);
+            pthread_mutex_lock(&args->mutex);
+            if(i<E_BARRA && args->yes){
+                bar[i++] = '#';
+                args->yes=0;
+            }
+            pthread_mutex_unlock(&args->mutex);
+            /*if(comprobar(&args->blk,&args->mutex)){
+                pthread_cond_wait(&args->cond,&args->m_cond);//no se pone con un while porque en este caso no hace falta
+            }*/
+        }
+        usleep(1000000);
+        //printf("\n");
+        
+        return NULL;
+}
+
+struct thread_info *init_threads(struct args *args,struct md5_info *md5){
+    struct thread_info *ar=malloc(sizeof(struct thread_info)*T_INIT);
+    struct abreak *ar1=malloc(sizeof(struct abreak));
+    ar1->md5=md5;
+    ar1->cnt=0;
+    pthread_mutex_init(&ar1->mutex,NULL);
+    ar1->args=args;
+
+    
+    
+    for(int i=0;i<T_INIT;i++){
+        ar[i].args=ar1;
+        if(pthread_create(&ar[i].id,NULL,break_pass,ar[i].args) != 0){
+            printf("Could not create thread #%d", i);
+            exit(1);
+        }
+    }
+    for(int i=0;i<T_INIT; i++){
+        pthread_join(ar[i].id,NULL);
+    }
+    return ar;
+
+
+
+}
+
+
+
+struct args  *lanzar_barra(){
+    struct args *args= malloc(sizeof(struct args));
+    long iters= ipow(26,PASS_LEN);
+    args->limit = iters/E_BARRA;
+    args->cnt=0;
+    args->blk=1;
+    args->yes=0;
+    args->estimacion=0;
+    pthread_mutex_init(&args->m_cond,NULL);
+    pthread_mutex_init(&args->mutex,NULL);
+    pthread_cond_init(&args->cond,NULL);
+    pthread_create(&args->id,NULL,progressBar,args);
+    return args;
+
+}
+
+void destruir(struct thread_info *ar, char **s){
+    for(int i=0;i<T_INIT; i++){
+        pthread_join(ar[i].id,NULL);
+    }
+    printf("%s: %s                                        \n", s[ar->args->md5->i_resuelto+1], ar[0].args->pass);
+    free(ar[0].args->pass);
+    for(int i=0;i<ar[0].args->md5->md5_len;i++){
+        free(ar[0].args->md5->md5[i]);
+    }
+    free(ar[0].args->md5->md5);
+    pthread_mutex_destroy(&ar[0].args->mutex);
+    pthread_cond_broadcast(&ar[0].args->args->cond);
+    pthread_mutex_destroy(&ar[0].args->mutex);
+    pthread_mutex_destroy(&ar[0].args->args->m_cond);
+    pthread_cond_destroy(&ar[0].args->args->cond);
+    free(ar[0].args->args);
+    free(ar[0].args);
+    free(ar);
+
+
+}
+
+int main(int argc, char *argv[]) {
+    if(argc < 2) {
+        printf("Use: %s string\n", argv[0]);
+        exit(0);
+    }
+    struct args *args;
+    struct thread_info *threads;
+    struct md5_info md5;
+    args=lanzar_barra();
+
+    //unsigned char md5_num[MD5_DIGEST_LENGTH];
+    //hex_to_num(argv[1], md5_num);
+    md5.md5_len=argc-1;
+    md5.md5=malloc(md5.md5_len);
+    for(int i=0;i<md5.md5_len;i++){
+        md5.md5[i]=malloc(sizeof(unsigned char)*MD5_DIGEST_LENGTH);
+        hex_to_num(argv[i+1], md5.md5[i]);
+    }
+    md5.i_resuelto=0;
+
+    threads=init_threads(args,&md5);
+
+    destruir(threads,argv);//destruye todo y hace el printf
+    return 0;
+}
